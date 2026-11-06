@@ -4,13 +4,14 @@
 //	publicwww search '"angular.min.js"' [per_page]
 //	publicwww export '"angular.min.js"' > sites.txt
 //	publicwww cluster-create --query '"googletagmanager.com/gtm.js"'
+//	publicwww cluster-create --query 'like:"online course" site:de' --limit 100
 //	publicwww extract 12 --presets email,phone > contacts.csv
+//	publicwww signatures 12
 package main
 
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,9 +23,10 @@ import (
 )
 
 const usage = `usage: publicwww account | search QUERY [PER_PAGE] | export QUERY
-       | clusters | cluster ID | cluster-create (--query Q | --domains-file F) [--name N]
+       | clusters | cluster ID | cluster-create (--query Q [--limit N] | --domains-file F) [--name N]
        | cluster-combine and|or|diff ID ID... [--name N] | presets
-       | extract ID [--presets a,b] [--regex R]... [--offset N] | cluster-rename ID NAME | cluster-delete ID`
+       | extract ID [--presets a,b] [--regex R]... [--offset N] [--delimiter C] | signatures ID
+       | cluster-rename ID NAME | cluster-delete ID`
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -75,7 +77,7 @@ func clusterLine(c *publicwww.Cluster) {
 
 func run(args []string) error {
 	need := map[string]int{"account": 0, "search": 1, "export": 1, "clusters": 0, "cluster": 1, "cluster-create": 0,
-		"cluster-combine": 3, "presets": 0, "extract": 1, "cluster-rename": 2, "cluster-delete": 1}
+		"cluster-combine": 3, "presets": 0, "extract": 1, "signatures": 1, "cluster-rename": 2, "cluster-delete": 1}
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -113,7 +115,14 @@ func run(args []string) error {
 		if p.Truncated {
 			note = " (cut short by the plan)"
 		}
-		fmt.Printf("%d sites match, page %d of %d%s\n", p.Total, p.Page, p.TotalPages, note)
+		more := ""
+		if p.TotalCapped {
+			more = "more than "
+		}
+		fmt.Printf("%s%d sites match, page %d of %d%s\n", more, p.Total, p.Page, p.TotalPages, note)
+		if p.QueryNote != "" {
+			fmt.Fprintln(os.Stderr, "note: "+p.QueryNote)
+		}
 		for _, r := range p.Results {
 			rank := ""
 			if r.Rank != nil {
@@ -157,7 +166,13 @@ func run(args []string) error {
 	case "cluster-create":
 		var c *publicwww.Cluster
 		if opt["query"] != "" {
-			c, err = pw.CreateCluster(ctx, opt["query"], opt["name"])
+			limit := 0
+			if opt["limit"] != "" {
+				if limit, err = strconv.Atoi(opt["limit"]); err != nil {
+					return fmt.Errorf("not a limit: %q", opt["limit"])
+				}
+			}
+			c, err = pw.CreateClusterLimit(ctx, opt["query"], opt["name"], limit)
 		} else {
 			var data []byte
 			if f := opt["domains-file"]; f == "-" {
@@ -180,6 +195,9 @@ func run(args []string) error {
 			return err
 		}
 		clusterLine(c)
+		if c.QueryNote != "" {
+			fmt.Fprintln(os.Stderr, "note: "+c.QueryNote)
+		}
 	case "cluster-combine":
 		from, err := ids(pos[1:])
 		if err != nil {
@@ -215,25 +233,43 @@ func run(args []string) error {
 				return fmt.Errorf("not an offset: %q", opt["offset"])
 			}
 		}
-		w := csv.NewWriter(os.Stdout)
-		defer w.Flush()
-		if offset == 0 {
-			w.Write(append(append([]string{"domain"}, presets...), regex...))
+		for {
+			x, err := pw.ExtractCSV(ctx, id[0], publicwww.ExtractOptions{Presets: presets, Regex: regex, Offset: offset},
+				opt["delimiter"], offset == 0)
+			if err != nil {
+				return err
+			}
+			os.Stdout.Write(x.CSV)
+			if x.NextOffset == nil {
+				fmt.Fprintf(os.Stderr, "%d extraction points left\n", x.PointsLeft)
+				break
+			}
+			offset = *x.NextOffset
+			if x.PointsLeft <= 0 {
+				return fmt.Errorf("the day's extraction points ran out; resume with --offset %d", offset)
+			}
 		}
-		n := 0
-		last, err := pw.ExtractAll(ctx, id[0], publicwww.ExtractOptions{Presets: presets, Regex: regex, Offset: offset},
-			func(r publicwww.ExtractRow) error {
-				cells := []string{r.Domain}
-				for _, v := range r.Values {
-					cells = append(cells, strings.Join(v, "\n"))
-				}
-				n++
-				return w.Write(cells)
-			})
+	case "signatures":
+		id, err := ids(pos[:1])
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "%d sites with matches, %d extraction points left\n", n, last.PointsLeft)
+		res, err := pw.Signatures(ctx, id[0])
+		if err != nil {
+			return err
+		}
+		for _, s := range res.Signatures {
+			websites := ""
+			if s.Websites != nil {
+				websites = strconv.Itoa(*s.Websites)
+			} else if s.WebsitesMax != nil {
+				websites = "<" + strconv.Itoa(*s.WebsitesMax)
+			}
+			fmt.Printf("%s\t%d\t%s\t%s\n", s.Query, s.InCluster, websites, s.Technology)
+		}
+		if res.Note != "" {
+			fmt.Fprintln(os.Stderr, "note: "+res.Note)
+		}
 	case "cluster-rename":
 		id, err := ids(pos[:1])
 		if err != nil {

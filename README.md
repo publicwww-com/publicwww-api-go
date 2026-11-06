@@ -61,7 +61,10 @@ pull values out of their page source or to combine with other clusters. See
 
 ```sh
 publicwww cluster-create --query '"googletagmanager.com/gtm.js"'   # prints id, size, created, name
+publicwww cluster-create --query 'like:"online course" site:de' --limit 100   # sites about a topic; like: removes nothing, so pass --limit
 publicwww extract 12 --presets email,phone > contacts.csv          # the whole cluster, part after part
+publicwww extract 12 --presets email --delimiter ';' > emails.csv
+publicwww signatures 12    # code the sites share, as searches for more like them
 publicwww extract 12 --regex '/data-site-id="([0-9]+)"/i' > ids.csv
 publicwww cluster-combine diff 14 12 --name "new this month"       # also: and, or
 publicwww clusters      # and: cluster ID, presets, cluster-rename ID NAME, cluster-delete ID
@@ -70,6 +73,7 @@ publicwww clusters      # and: cluster ID, presets, cluster-rename ID NAME, clus
 ```go
 gtm, err := pw.CreateCluster(ctx, `"googletagmanager.com/gtm.js"`, "") // costs one search
 mine, err := pw.CreateClusterFromDomains(ctx, []string{"example.com", "https://example.org/"}, "mine")
+topic, err := pw.CreateClusterLimit(ctx, `like:"online course" site:de`, "", 100) // the first 100 by similarity
 
 // Every site, in parts of up to 1000 (following NextOffset); spends extraction points.
 opt := publicwww.ExtractOptions{Presets: []string{"email", "phone"}}

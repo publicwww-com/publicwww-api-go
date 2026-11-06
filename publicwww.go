@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-const userAgent = "publicwww-api-go/1.1"
+const userAgent = "publicwww-api-go/1.2"
 
 // Result is one site. Rank is nil when the site has no rank.
 type Result struct {
@@ -44,22 +44,26 @@ type Result struct {
 
 // Page is one page of search results.
 type Page struct {
-	Query      string   `json:"query"`
-	Page       int      `json:"page"`
-	PerPage    int      `json:"per_page"`
-	Total      int      `json:"total"`
-	TotalPages int      `json:"total_pages"`
-	Returned   int      `json:"returned"`
-	Truncated  bool     `json:"truncated"`
-	TookMs     int      `json:"took_ms"`
-	Results    []Result `json:"results"`
+	Query         string   `json:"query"`
+	OriginalQuery string   `json:"original_query,omitempty"` // the query as sent, when it was rewritten
+	QueryNote     string   `json:"query_note,omitempty"`
+	Page          int      `json:"page"`
+	PerPage       int      `json:"per_page"`
+	Total         int      `json:"total"`
+	TotalCapped   bool     `json:"total_capped,omitempty"` // Total is the ceiling: the search found more
+	TotalPages    int      `json:"total_pages"`
+	Returned      int      `json:"returned"`
+	Truncated     bool     `json:"truncated"`
+	TookMs        int      `json:"took_ms"`
+	Results       []Result `json:"results"`
 }
 
 // Meta is the first line of an NDJSON answer.
 type Meta struct {
-	Total     int  `json:"total"`
-	Returned  int  `json:"returned"`
-	Truncated bool `json:"truncated"`
+	Total       int  `json:"total"`
+	TotalCapped bool `json:"total_capped,omitempty"`
+	Returned    int  `json:"returned"`
+	Truncated   bool `json:"truncated"`
 }
 
 // Account is the plan, quota and limits behind the key.
@@ -87,16 +91,24 @@ type Account struct {
 }
 
 // Cluster is a saved list of sites. Page, PerPage, TotalPages and Domains
-// are filled by Client.Cluster - one page of its domains.
+// are filled by Client.Cluster - one page of its domains. Query, Total and the
+// fields after them come when it is created from a search, Submitted from a
+// list.
 type Cluster struct {
-	ID         int      `json:"id"`
-	Name       string   `json:"name"`
-	Size       int      `json:"size"`
-	Created    string   `json:"created"`
-	Page       int      `json:"page,omitempty"`
-	PerPage    int      `json:"per_page,omitempty"`
-	TotalPages int      `json:"total_pages,omitempty"`
-	Domains    []string `json:"domains,omitempty"`
+	ID            int      `json:"id"`
+	Name          string   `json:"name"`
+	Size          int      `json:"size"`
+	Created       string   `json:"created"`
+	Page          int      `json:"page,omitempty"`
+	PerPage       int      `json:"per_page,omitempty"`
+	TotalPages    int      `json:"total_pages,omitempty"`
+	Domains       []string `json:"domains,omitempty"`
+	Query         string   `json:"query,omitempty"`
+	OriginalQuery string   `json:"original_query,omitempty"`
+	QueryNote     string   `json:"query_note,omitempty"`
+	Total         int      `json:"total,omitempty"`
+	TotalCapped   bool     `json:"total_capped,omitempty"`
+	Submitted     int      `json:"submitted,omitempty"`
 }
 
 // ClusterList is the account's clusters, newest first.
@@ -140,11 +152,43 @@ type Extraction struct {
 	InIndex     int          `json:"in_index"`
 	WithMatches int          `json:"with_matches"`
 	NextOffset  *int         `json:"next_offset"`
+	Columns     []string     `json:"columns"` // names of the lists in each row's Values, in the same order
 	Regex       []string     `json:"regex"`
 	PointsUsed  float64      `json:"points_used"`
 	PointsLeft  int          `json:"points_left"`
 	Stopped     string       `json:"stopped,omitempty"`
 	Rows        []ExtractRow `json:"rows"`
+}
+
+// ExtractedCSV is one part of an extraction as CSV. NextOffset is nil when the
+// cluster is done.
+type ExtractedCSV struct {
+	CSV        []byte
+	NextOffset *int
+	PointsLeft int
+}
+
+// Signature is code the cluster's websites share: search for Query in double
+// quotes to find more such websites. Websites is a rough count in the whole
+// index, nil when rarer than WebsitesMax.
+type Signature struct {
+	Query       string `json:"query"`
+	InCluster   int    `json:"in_cluster"`
+	Websites    *int   `json:"websites"`
+	WebsitesMax *int   `json:"websites_max"`
+	Technology  string `json:"technology,omitempty"`
+}
+
+// Signatures is the answer to Client.Signatures. Note says so when nothing
+// ties the websites together.
+type Signatures struct {
+	ID               int         `json:"id"`
+	Name             string      `json:"name"`
+	Size             int         `json:"size"`
+	DomainsUsed      int         `json:"domains_used"`
+	WebsitesWithCode int         `json:"websites_with_code"`
+	Signatures       []Signature `json:"signatures"`
+	Note             string      `json:"note,omitempty"`
 }
 
 // Deleted is the answer to DeleteCluster.
@@ -367,8 +411,19 @@ func (c *Client) ClusterDomains(ctx context.Context, id int, fn func(string) err
 // search, like Search. An empty name means the query. 409 cluster_limit when
 // the account has 100 clusters.
 func (c *Client) CreateCluster(ctx context.Context, query, name string) (*Cluster, error) {
+	return c.CreateClusterLimit(ctx, query, name, 0)
+}
+
+// CreateClusterLimit is CreateCluster that takes only the first limit results
+// of the search, in its own order; 0 means up to the plan's maximum. Pass it
+// with like:, or the cluster takes that maximum.
+func (c *Client) CreateClusterLimit(ctx context.Context, query, name string, limit int) (*Cluster, error) {
+	body := map[string]any{"query": query, "name": name}
+	if limit > 0 {
+		body["limit"] = limit
+	}
 	var cl Cluster
-	return &cl, c.call(ctx, "/v1/clusters", nil, map[string]any{"query": query, "name": name}, &cl)
+	return &cl, c.call(ctx, "/v1/clusters", nil, body, &cl)
 }
 
 // CreateClusterFromDomains makes a cluster from domains or urls; only sites
@@ -407,6 +462,45 @@ func (c *Client) Extract(ctx context.Context, id int, opt ExtractOptions) (*Extr
 	}
 	var x Extraction
 	return &x, c.call(ctx, "/v1/clusters/"+strconv.Itoa(id)+"/extract", nil, body, &x)
+}
+
+// ExtractCSV runs one part of an extraction and returns it as CSV. An empty
+// delimiter means a comma; header adds a first line with the column names. It
+// costs extraction points.
+func (c *Client) ExtractCSV(ctx context.Context, id int, opt ExtractOptions, delimiter string, header bool) (*ExtractedCSV, error) {
+	if opt.Limit == 0 {
+		opt.Limit = 1000
+	}
+	body := map[string]any{
+		"presets": append([]string{}, opt.Presets...), "regex": append([]string{}, opt.Regex...),
+		"offset": opt.Offset, "limit": opt.Limit, "skip_empty": !opt.IncludeEmpty,
+		"format": "csv", "header": header,
+	}
+	if delimiter != "" {
+		body["delimiter"] = delimiter
+	}
+	res, err := c.get(ctx, "/v1/clusters/"+strconv.Itoa(id)+"/extract", nil, body)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	x := &ExtractedCSV{CSV: data}
+	x.PointsLeft, _ = strconv.Atoi(res.Header.Get("X-Points-Left"))
+	if next, err := strconv.Atoi(res.Header.Get("X-Next-Offset")); err == nil {
+		x.NextOffset = &next
+	}
+	return x, nil
+}
+
+// Signatures finds code the cluster's websites share, as ready searches for
+// more like them. It spends nothing.
+func (c *Client) Signatures(ctx context.Context, id int) (*Signatures, error) {
+	var s Signatures
+	return &s, c.call(ctx, "/v1/clusters/"+strconv.Itoa(id)+"/signatures", nil, nil, &s)
 }
 
 // ExtractAll goes through the whole cluster from opt.Offset, part after part
