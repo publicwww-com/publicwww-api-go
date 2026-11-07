@@ -1,7 +1,7 @@
 # PublicWWW API - Go
 
 A small client for the [PublicWWW API](https://publicwww.com/docs/api/): search the
-source code (HTML, JavaScript, CSS) of hundreds of millions of websites from your
+source code (HTML, JavaScript, CSS) of web pages from your
 own code. Standard library only.
 
 ```sh
